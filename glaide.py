@@ -305,6 +305,8 @@ class Tab:
         self.spawned = False   # Claude (or the shell) has been started in this tab
         self.first = not fresh # next start is the first one: try to continue
         self.started = 0.0     # when its program was last started (monotonic clock)
+        self.waiting = False   # its first start is waiting for the terminal to get its size
+        self.sized_once = False
         self.state = "idle"    # idle | working | done | attention | error
         self.note = ""         # what the dot is about: start of Claude's reply or question
 
@@ -770,7 +772,7 @@ class Drawer(Gtk.Application):
         if not tab.button.get_active():
             tab.button.set_active(True)
         if not tab.spawned:
-            self.spawn(tab)
+            self.spawn_when_sized(tab)
         if self.watching():
             self.mark_seen(i)
         tab.term.grab_focus()
@@ -790,6 +792,29 @@ class Drawer(Gtk.Application):
             self.toggle()
         else:
             self.win.present()
+
+    def spawn_when_sized(self, tab, tries=0):
+        """Start the tab's program once its terminal has its real size.
+
+        Started any earlier it sees the default 80x24 and lays out its first
+        output (a shell greeting, say) for the wrong width.
+        """
+        if tries == 0:
+            if tab.waiting:
+                return GLib.SOURCE_REMOVE      # already on its way
+            tab.waiting = True
+            tab.started = time.monotonic()
+        if tab.spawned or tab not in self.tabs:
+            tab.waiting = False
+            return GLib.SOURCE_REMOVE
+        sized = tab.term.get_mapped() and tab.term.get_width() > 1
+        if tries < 40 and not (sized and tab.sized_once):
+            tab.sized_once = sized             # start one tick after it first has a size
+            GLib.timeout_add(25, self.spawn_when_sized, tab, tries + 1)
+            return GLib.SOURCE_REMOVE
+        tab.waiting = False                    # after a second, start anyway (drawer hidden)
+        self.spawn(tab)
+        return GLib.SOURCE_REMOVE
 
     def spawn(self, tab):
         claude = CLAUDE
