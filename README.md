@@ -2,6 +2,8 @@
 
 A slide-out drawer of [Claude Code](https://claude.com/claude-code) terminals for Wayland desktops. Press a shortcut and it glides in from the left edge of the screen; click elsewhere and it glides away, while Claude keeps working.
 
+![The drawer sliding in from the left edge, with a Claude tab, a terminal tab, the theme menu and a second Claude tab](docs/demo.webp)
+
 The name is *glide* with an AI in the middle. This is an independent project and is not affiliated with or endorsed by Anthropic.
 
 ## What it does
