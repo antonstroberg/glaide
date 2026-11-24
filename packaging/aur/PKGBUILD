@@ -1,0 +1,30 @@
+# Maintainer: Anton Stroberg
+pkgname=glaide-git
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Slide-out drawer of Claude Code terminals for Wayland desktops"
+arch=('any')
+url="https://github.com/antonstroberg/glaide"
+license=('MIT')
+depends=('python' 'python-gobject' 'python-cairo' 'gtk4' 'gtk4-layer-shell' 'vte4' 'jq' 'glib2')
+optdepends=('spectacle: screenshot to Claude on KDE Plasma'
+            'grim: screenshot to Claude on wlroots desktops'
+            'slurp: screenshot to Claude on wlroots desktops'
+            'code: open clicked file paths in VS Code')
+makedepends=('git')
+provides=('glaide')
+conflicts=('glaide')
+source=("git+$url.git")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd glaide
+    git describe --long --tags 2>/dev/null | sed 's/^v//;s/-/.r/;s/-/./' \
+        || printf '0.1.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+package() {
+    cd glaide
+    make DESTDIR="$pkgdir" PREFIX=/usr install
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Glaide
+Comment=Slide-out drawer of Claude Code terminals
+Exec=@PREFIX@/bin/glaide
+Icon=utilities-terminal
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=claude;terminal;drawer;
+X-KDE-Shortcuts=Meta+C

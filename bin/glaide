@@ -1,0 +1,7 @@
+#!/bin/sh
+# Controls the Glaide drawer:  glaide [toggle|pin|screenshot]
+# Without an argument it toggles the drawer. The call goes over D-Bus, which
+# also starts the drawer if it is not running yet.
+exec gdbus call --session --dest io.github.antonstroberg.Glaide \
+    --object-path /io/github/antonstroberg/Glaide \
+    --method org.gtk.Actions.Activate "${1:-toggle}" '[]' '{}' >/dev/null

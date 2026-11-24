@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Glaide: screenshot to Claude
+Comment=Select part of the screen and hand the picture to Claude in the drawer
+Exec=@PREFIX@/bin/glaide screenshot
+Icon=utilities-terminal
+Terminal=false
+NoDisplay=true
+X-KDE-Shortcuts=Meta+Shift+C
