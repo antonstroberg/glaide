@@ -1,7 +1,47 @@
 #!/bin/sh
-# Controls the Glaide drawer:  glaide [toggle|pin|screenshot]
+# Controls the Glaide drawer:  glaide [toggle|pin|screenshot|quit]
 # Without an argument it toggles the drawer. The call goes over D-Bus, which
 # also starts the drawer if it is not running yet.
-exec gdbus call --session --dest io.github.antonstroberg.Glaide \
-    --object-path /io/github/antonstroberg/Glaide \
-    --method org.gtk.Actions.Activate "${1:-toggle}" '[]' '{}' >/dev/null
+bus=${GLAIDE_APP_ID:-io.github.antonstroberg.Glaide}
+action=${1:-toggle}
+
+case $action in
+toggle|pin|screenshot|quit) ;;
+-h|--help|help)
+    cat <<'EOF'
+usage: glaide [toggle|pin|screenshot|quit]
+
+  toggle      show or hide the drawer (the default)
+  pin         keep it open when you click elsewhere, or let it slide away again
+  screenshot  select part of the screen and put the picture into the prompt
+  quit        stop the drawer and the programs in its tabs
+EOF
+    exit 0 ;;
+*)
+    echo "glaide: unknown action '$action' (try: glaide --help)" >&2
+    exit 2 ;;
+esac
+
+# Sends the action; prints nothing but the error, if there is one.
+send() {
+    gdbus call --session --dest "$bus" --object-path "/$(printf %s "$bus" | tr . /)" \
+        --method org.gtk.Actions.Activate "$action" '[]' '{}' 2>&1 >/dev/null
+}
+
+if [ "$action" = quit ]; then
+    # Do not start the drawer only to stop it again.
+    running=$(gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.NameHasOwner "$bus" 2>/dev/null)
+    case $running in *true*) ;; *) exit 0 ;; esac
+fi
+
+error=$(send) && exit 0
+case $error in
+*ServiceUnknown*|*"not activatable"*)
+    # Just installed: the session bus has not noticed the new service yet.
+    gdbus call --session --dest org.freedesktop.DBus --object-path /org/freedesktop/DBus \
+        --method org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1
+    error=$(send) && exit 0 ;;
+esac
+printf '%s\n' "$error" >&2
+exit 1

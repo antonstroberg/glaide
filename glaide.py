@@ -33,11 +33,16 @@ Look
 
 Extras
     Ctrl+click opens a link in the browser and a file path (optionally with
-    :line) in VS Code. "glaide screenshot" lets you select a part of the screen
-    and puts the picture's path into the current tab's prompt.
+    :line) in your editor. "glaide screenshot" lets you select a part of the
+    screen and puts the picture's path into the current tab's prompt.
+
+Settings
+    ~/.config/glaide/glaide.conf says where Claude Code is, which folder the
+    default tab uses, how wide the drawer starts and which editor opens files.
 
 The program is a single-instance D-Bus service: the "glaide" command only sends
-it an action (toggle, pin, screenshot), so a keyboard shortcut reacts instantly.
+it an action (toggle, pin, screenshot, quit), so a keyboard shortcut reacts
+instantly.
 """
 import json
 import math
@@ -53,8 +58,16 @@ from ctypes import CDLL
 
 import cairo
 
-# gtk4-layer-shell must be loaded before libwayland/GTK.
-CDLL("libgtk4-layer-shell.so")
+# gtk4-layer-shell must be loaded before libwayland/GTK. Many distributions keep
+# the plain ".so" name in their development package, so ask for ".so.0" first.
+for _lib in ("libgtk4-layer-shell.so.0", "libgtk4-layer-shell.so"):
+    try:
+        CDLL(_lib)
+        break
+    except OSError:
+        pass
+else:
+    sys.exit("glaide: the gtk4-layer-shell library was not found; please install it")
 
 import gi  # noqa: E402
 
@@ -66,20 +79,11 @@ from gi.repository import Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
 
 APP_ID = os.environ.get("GLAIDE_APP_ID", "io.github.antonstroberg.Glaide")
-WIDTH_FRACTION = float(os.environ.get("GLAIDE_WIDTH", "0.42"))  # of screen width
+DEFAULT_WIDTH = 0.42   # share of the screen width, until you drag the edge
 MIN_WIDTH = 420
 HANDLE_WIDTH = 6
 ANIM_MS = 180
 FONT = os.environ.get("GLAIDE_FONT", "Monospace 11")
-# The Claude Code program: $GLAIDE_CLAUDE, else "claude" on the PATH, else where its
-# installer puts it (a D-Bus started service often has a short PATH).
-CLAUDE = (
-    os.environ.get("GLAIDE_CLAUDE")
-    or shutil.which("claude")
-    or os.path.expanduser("~/.local/bin/claude")
-)
-# Folder of the Claude tab you get before listing any projects.
-WORKDIR = os.environ.get("GLAIDE_CWD", os.path.expanduser("~"))
 CONFIG_DIR = os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "glaide"
 )
@@ -87,6 +91,7 @@ CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser(
 PROJECTS_FILE = os.environ.get("GLAIDE_PROJECTS", os.path.join(CONFIG_DIR, "projects.conf"))
 APPEARANCE_FILE = os.environ.get("GLAIDE_APPEARANCE", os.path.join(CONFIG_DIR, "appearance.conf"))
 STATE_FILE = os.environ.get("GLAIDE_STATE", os.path.join(CONFIG_DIR, "state.json"))
+SETTINGS_FILE = os.environ.get("GLAIDE_SETTINGS", os.path.join(CONFIG_DIR, "glaide.conf"))
 HERE = os.path.dirname(os.path.abspath(__file__))
 HOOK_SCRIPT = os.path.join(HERE, "hook.sh")
 HOOK_SETTINGS = os.path.join(CACHE_DIR, "claude-settings.json")  # written at start, see below
@@ -94,6 +99,29 @@ TEST_CMD = os.environ.get("GLAIDE_CMD")  # run this instead of Claude (for testi
 SHELL = pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
 SHOT_DIR = os.path.join(CACHE_DIR, "screenshots")
 SHOT_KEEP_DAYS = 7
+DEBUG = bool(os.environ.get("GLAIDE_DEBUG"))   # also log what the drawer is doing
+# A program that ends this soon after starting is not restarted: it would only
+# end again, over and over.
+QUICK_EXIT_SECONDS = 2.0
+SETTINGS_TEMPLATE = """\
+# Glaide settings. A change applies the next time the setting is used; the
+# drawer does not need a restart.
+#
+# claude  the Claude Code program, if Glaide does not find "claude" by itself
+# folder  folder of the Claude tab you get before listing any projects
+# width   how wide the drawer starts, as a share of the screen (0.42 is 42%)
+# editor  command that opens a file you Ctrl+click. {file}, {line} and {column}
+#         are filled in. Without it: VS Code if installed, else the default app.
+
+# claude = ~/.local/bin/claude
+# folder = ~/projects
+# width = 0.42
+# editor = zed {file}:{line}
+"""
+UNSUPPORTED = (
+    "Glaide needs a Wayland desktop with the layer-shell protocol, such as KDE Plasma, "
+    "Sway or Hyprland. It cannot run on GNOME or X11."
+)
 
 # What Ctrl+click recognises. The path pattern is loose on purpose: a match only
 # opens if the file really exists (see link_target).
@@ -126,7 +154,7 @@ def write_hook_settings():
     started by the drawer. Each hook runs hook.sh with the state to report.
     """
     def run(state):
-        return {"type": "command", "command": f'"{HOOK_SCRIPT}" {state}', "async": True, "timeout": 5}
+        return {"type": "command", "command": f"{shlex.quote(HOOK_SCRIPT)} {state}", "async": True, "timeout": 5}
 
     hooks = {
         "UserPromptSubmit": [{"hooks": [run("working")]}],
@@ -157,31 +185,92 @@ def screenshot_command(path):
     return None
 
 
-def load_projects():
-    """[(tab name, "claude" or "shell", folder, listed in the file)] from the projects file.
-
-    There is always at least one Claude tab and one shell tab.
-    """
-    projects = []
+def read_conf(path):
+    """{key: value} from a file of "key = value" lines; a line starting with "#" is a comment."""
+    values = {}
     try:
-        for line in read_text(PROJECTS_FILE).splitlines():
+        for line in read_text(path).splitlines():
             line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            name, path = (x.strip() for x in line.split("=", 1))
-            kind = "claude"
-            if path.startswith("shell:"):
-                kind, path = "shell", path[6:].strip() or "~"
-            path = os.path.expanduser(path)
-            if name and os.path.isdir(path):
-                projects.append((name, kind, path, True))
+            if line and not line.startswith("#") and "=" in line:
+                key, value = (x.strip() for x in line.split("=", 1))
+                values[key.lower()] = value
     except OSError:
         pass
-    if not any(p[1] == "claude" for p in projects):
-        projects.insert(0, ("Claude", "claude", WORKDIR, False))
-    if not any(p[1] == "shell" for p in projects):
-        projects.append(("Terminal", "shell", os.path.expanduser("~"), False))
-    return projects
+    return values
+
+
+def setting(key, env, default=""):
+    """A setting: from the environment (handy for trying things out), else from glaide.conf.
+
+    The file is read each time, so a change needs no restart. The drawer is
+    usually started by D-Bus, which does not pass on your shell's environment;
+    that is why the file is the place for these.
+    """
+    return os.environ.get(env) or read_conf(SETTINGS_FILE).get(key) or default
+
+
+def claude_program():
+    """Path of the Claude Code program, or None if there is none.
+
+    The "claude" setting; without it, "claude" on the PATH, else where its
+    installer puts it (a D-Bus started service often has a short PATH).
+    """
+    chosen = setting("claude", "GLAIDE_CLAUDE")
+    for candidate in [chosen] if chosen else ["claude", "~/.local/bin/claude"]:
+        found = shutil.which(os.path.expanduser(candidate))
+        if found:
+            return found
+    return None
+
+
+def claude_command(claude, first, hooks):
+    """The command that starts Claude Code in a tab.
+
+    The first start in a tab picks up the folder's last conversation, and
+    starts plainly if there is none.
+    """
+    argv = [claude] + (["--settings", HOOK_SETTINGS] if hooks else [])
+    if first:
+        argv = ["/bin/sh", "-c", '"$@" --continue || exec "$@"', "glaide"] + argv
+    return argv
+
+
+def default_folder():
+    """Folder of the Claude tab you get before listing any projects."""
+    folder = os.path.expanduser(setting("folder", "GLAIDE_CWD", "~"))
+    return folder if os.path.isdir(folder) else os.path.expanduser("~")
+
+
+def width_fraction():
+    """Starting width of the drawer as a share of the screen width."""
+    try:
+        return max(0.1, min(0.95, float(setting("width", "GLAIDE_WIDTH").replace(",", "."))))
+    except ValueError:
+        return DEFAULT_WIDTH
+
+
+def editor_command(path, line, col):
+    """The command that opens a text file, at a line if one is given; None for the default app.
+
+    The "editor" setting with {file}, {line} and {column} filled in (the file is
+    added at the end if the setting does not place it). Without the setting,
+    VS Code if it is installed.
+    """
+    try:
+        words = shlex.split(setting("editor", "GLAIDE_EDITOR"))
+    except ValueError:      # a quote that is never closed
+        words = []
+    if words:
+        if not any("{file}" in word for word in words):
+            words.append("{file}")
+        fill = {"file": path, "line": line or "1", "column": col or "1"}
+        words = [re.sub(r"\{(file|line|column)\}", lambda m: fill[m.group(1)], word) for word in words]
+        return [os.path.expanduser(words[0])] + words[1:]
+    code = shutil.which("code") or shutil.which("codium")
+    if code:
+        where = path + (f":{line}" if line else "") + (f":{col}" if line and col else "")
+        return [code, "--goto", where]
+    return None
 
 
 def _project_line(line):
@@ -194,6 +283,26 @@ def _project_line(line):
     if path.startswith("shell:"):
         kind, path = "shell", path[6:].strip() or "~"
     return name, kind, os.path.normpath(os.path.expanduser(path))
+
+
+def load_projects():
+    """[(tab name, "claude" or "shell", folder, listed in the file)] from the projects file.
+
+    There is always at least one Claude tab and one shell tab.
+    """
+    projects = []
+    try:
+        for line in read_text(PROJECTS_FILE).splitlines():
+            entry = _project_line(line)
+            if entry and entry[0] and os.path.isdir(entry[2]):
+                projects.append(entry + (True,))
+    except OSError:
+        pass
+    if not any(p[1] == "claude" for p in projects):
+        projects.insert(0, ("Claude", "claude", default_folder(), False))
+    if not any(p[1] == "shell" for p in projects):
+        projects.append(("Terminal", "shell", os.path.expanduser("~"), False))
+    return projects
 
 
 def remember_project(name, path):
@@ -249,17 +358,16 @@ def link_target(text, cwd):
 
 
 def open_target(target):
-    """Open a link_target result: browser, VS Code for text files, else the default app."""
+    """Open a link_target result: browser, your editor for text files, else the default app."""
     if target[0] == "url":
         Gio.AppInfo.launch_default_for_uri(target[1], None)
         return
     _kind, path, line, col = target
     ctype, _uncertain = Gio.content_type_guess(path, None)
     is_text = os.path.isfile(path) and (line or Gio.content_type_is_a(ctype, "text/plain"))
-    code = shutil.which("code") or shutil.which("codium")
-    if is_text and code:
-        where = path + (f":{line}" if line else "") + (f":{col}" if line and col else "")
-        Gio.Subprocess.new([code, "--goto", where], Gio.SubprocessFlags.NONE)
+    command = editor_command(path, line, col) if is_text else None
+    if command:
+        Gio.Subprocess.new(command, Gio.SubprocessFlags.NONE)
     else:
         Gio.AppInfo.launch_default_for_uri(GLib.filename_to_uri(path, None), None)
 
@@ -295,6 +403,25 @@ def log(msg):
     print(msg, file=sys.stderr, flush=True)
 
 
+def debug(msg):
+    if DEBUG:
+        log(msg)
+
+
+def tell_user(title, body):
+    """Say why the drawer cannot open, also when a shortcut started it and no terminal shows."""
+    log(f"glaide: {body}")
+    try:
+        Gio.bus_get_sync(Gio.BusType.SESSION, None).call_sync(
+            "org.freedesktop.Notifications", "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications", "Notify",
+            GLib.Variant("(susssasa{sv}i)", ("Glaide", 0, "utilities-terminal", title, body, [], {}, -1)),
+            None, Gio.DBusCallFlags.NONE, 2000, None,
+        )
+    except GLib.Error:
+        pass
+
+
 class Tab:
     def __init__(self, uid, name, kind, cwd, term, label, button, saved, fresh):
         self.uid = uid         # stays the same while tabs around it come and go
@@ -307,6 +434,7 @@ class Tab:
         self.started = 0.0     # when its program was last started (monotonic clock)
         self.waiting = False   # its first start is waiting for the terminal to get its size
         self.sized_once = False
+        self.halted = False    # its program is not running and Enter starts it (see Drawer.halt)
         self.state = "idle"    # idle | working | done | attention | error
         self.note = ""         # what the dot is about: start of Claude's reply or question
 
@@ -359,15 +487,7 @@ def load_appearance():
 
     Anything missing or unreadable falls back to the mocha theme, solid, default font.
     """
-    values = {}
-    try:
-        for line in read_text(APPEARANCE_FILE).splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = (x.strip() for x in line.split("=", 1))
-                values[key.lower()] = value
-    except OSError:
-        pass
+    values = read_conf(APPEARANCE_FILE)
     theme = values.get("theme", "").lower()
     if theme not in THEMES:
         theme = "mocha"
@@ -463,6 +583,8 @@ class Drawer(Gtk.Application):
         self.css_look = None       # the look the stylesheet was last built from
         self.look_monitor = None
         self.look_timer = 0
+        self.projects_monitor = None
+        self.projects_timer = 0
         self.state = load_state()
 
     # ---- setup -------------------------------------------------------------
@@ -483,6 +605,8 @@ class Drawer(Gtk.Application):
             ("close-tab", "i", lambda _a, p: self.close_tab(p.get_int32())),
             ("set-width", "i", lambda _a, p: self.set_width(p.get_int32(), save=True)),
             ("screenshot", None, lambda *_: self.screenshot()),
+            # From an idle callback, so the caller gets its answer before the drawer is gone.
+            ("quit", None, lambda *_: GLib.idle_add(self.quit)),
         )
         for name, ptype, handler in actions:
             act = Gio.SimpleAction.new(name, GLib.VariantType.new(ptype) if ptype else None)
@@ -523,13 +647,14 @@ class Drawer(Gtk.Application):
             self.use_monitor(mons.get_item(0))
         win.set_default_size(self.width, -1)
 
-        if not os.path.exists(APPEARANCE_FILE):
-            try:
-                os.makedirs(os.path.dirname(APPEARANCE_FILE), exist_ok=True)
-                with open(APPEARANCE_FILE, "w") as f:
-                    f.write(APPEARANCE_TEMPLATE)
-            except OSError as e:
-                log(f"could not write {APPEARANCE_FILE}: {e}")
+        for path, template in ((APPEARANCE_FILE, APPEARANCE_TEMPLATE), (SETTINGS_FILE, SETTINGS_TEMPLATE)):
+            if not os.path.exists(path):
+                try:
+                    os.makedirs(os.path.dirname(path), exist_ok=True)
+                    with open(path, "w") as f:
+                        f.write(template)
+                except OSError as e:
+                    log(f"could not write {path}: {e}")
         self.look = load_appearance()
         self.sync_appearance_menu()
         self.css = Gtk.CssProvider()
@@ -544,6 +669,11 @@ class Drawer(Gtk.Application):
             Gio.FileMonitorFlags.NONE, None
         )
         self.look_monitor.connect("changed", self.on_appearance_file)
+        # The same for the list of tabs.
+        self.projects_monitor = Gio.File.new_for_path(PROJECTS_FILE).monitor_file(
+            Gio.FileMonitorFlags.NONE, None
+        )
+        self.projects_monitor.connect("changed", self.on_projects_file)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         box.set_hexpand(True)
@@ -750,7 +880,7 @@ class Drawer(Gtk.Application):
     def apply_appearance(self):
         self.look_timer = 0
         self.look = load_appearance()
-        log(f"appearance: theme {self.look['theme']}, opacity {self.look['opacity']}, font {self.look['font']}")
+        debug(f"appearance: theme {self.look['theme']}, opacity {self.look['opacity']}, font {self.look['font']}")
         self.sync_appearance_menu()
         for tab in self.tabs:
             self.style_tab(tab)
@@ -817,20 +947,21 @@ class Drawer(Gtk.Application):
         return GLib.SOURCE_REMOVE
 
     def spawn(self, tab):
-        claude = CLAUDE
-        hooks = f' --settings "{HOOK_SETTINGS}"' if self.hooks_ready else ""
+        tab.spawned = True
+        tab.halted = False
         if tab.kind == "shell":
             argv = [SHELL]
         elif TEST_CMD:
             argv = shlex.split(TEST_CMD)
-        elif tab.first:
-            # Pick up the folder's last conversation; plain start if there is none.
-            argv = ["/bin/sh", "-c", f'"{claude}"{hooks} --continue || exec "{claude}"{hooks}']
         else:
-            argv = ["/bin/sh", "-c", f'exec "{claude}"{hooks}']
+            claude = claude_program()
+            if claude is None:
+                self.halt(tab, self.claude_missing())
+                return
+            argv = claude_command(claude, tab.first, self.hooks_ready)
         tab.first = False
-        tab.spawned = True
         tab.started = time.monotonic()
+        debug(f"tab {tab.name}: starting {argv[0]}")
         env = dict(os.environ)
         if tab.kind == "claude":
             env["GLAIDE_TAB"] = str(tab.uid)   # read by hook.sh
@@ -841,11 +972,55 @@ class Drawer(Gtk.Application):
         )
 
     def on_spawned(self, _term, pid, error, tab):
+        tab.pid = pid if pid and pid > 0 else 0
         if error is not None:
             log(f"could not start the program in tab {tab.name}: {error.message}")
-        tab.pid = pid if pid and pid > 0 else 0
+            if tab in self.tabs:
+                self.halt(tab, f"The program for this tab could not be started: {error.message}")
+
+    def claude_missing(self):
+        chosen = setting("claude", "GLAIDE_CLAUDE")
+        if chosen:
+            return f'Claude Code was not found: the "claude" setting says {chosen}, which is not a program.'
+        return (
+            'Claude Code was not found. Install it, or say where it is with a line like\n'
+            f'    claude = /path/to/claude\nin {SETTINGS_FILE}'
+        )
+
+    def halt(self, tab, message):
+        """Leave the tab without a running program and say why; Enter starts it again."""
+        tab.halted = True
+        tab.pid = 0
+        debug(f"tab {tab.name}: not running: {message}")
+        text = f"\n\x1b[1mGlaide:\x1b[0m {message}\nPress Enter to try again.\n"
+        tab.term.feed(text.replace("\n", "\r\n").encode())
 
     # ---- adding and closing tabs -------------------------------------------
+    def on_projects_file(self, *_args):
+        if self.projects_timer:
+            GLib.source_remove(self.projects_timer)
+        self.projects_timer = GLib.timeout_add(300, self.sync_projects)   # editors save in several steps
+
+    def sync_projects(self):
+        """The projects file was saved: open a tab for each line that has none yet.
+
+        A tab whose line is gone stays open, since its program may be busy, but
+        is no longer a remembered one.
+        """
+        self.projects_timer = 0
+        listed = [entry[:3] for entry in load_projects() if entry[3]]
+        have = set()
+        for tab in self.tabs:
+            tab.saved = (tab.name, tab.kind, tab.cwd) in listed
+            have.add((tab.name, tab.kind, tab.cwd))
+        for entry in listed:
+            if entry not in have:
+                have.add(entry)
+                self.add_tab(*entry, saved=True)
+                debug(f"projects file: new tab {entry[0]}")
+        self.update_labels()
+        return GLib.SOURCE_REMOVE
+
     def add_tab(self, name, kind, cwd, saved=False, fresh=False):
         """Put a tab at the end of the bar. Its program starts when it is first shown."""
         term = self.make_term()
@@ -933,7 +1108,7 @@ class Drawer(Gtk.Application):
         cwd = cur.cwd
         if kind == "claude":
             if cwd == os.path.expanduser("~"):
-                cwd = WORKDIR
+                cwd = default_folder()
             base = cur.name if cur.kind == "claude" else "Claude"
         else:
             base = "Terminal"
@@ -973,12 +1148,12 @@ class Drawer(Gtk.Application):
 
     def menu_opened(self):
         self.menus_open += 1
-        log(f"menu opened ({self.menus_open} open)")
+        debug(f"menu opened ({self.menus_open} open)")
 
     def menu_closed(self):
         """A menu went away: back to the terminal, or slide out if you clicked elsewhere."""
         self.menus_open = max(0, self.menus_open - 1)
-        log(f"menu closed ({self.menus_open} open)")
+        debug(f"menu closed ({self.menus_open} open)")
         self.term.grab_focus()
 
         def settle():
@@ -1044,7 +1219,7 @@ class Drawer(Gtk.Application):
         """
         index, _, rest = message.partition(":")
         state, _, text = rest.partition(":")
-        log(f"tab-state {index}:{state} (+{len(text)} characters)")   # the text stays out of the log
+        debug(f"tab-state {index}:{state} (+{len(text)} characters)")   # the text stays out of the log
         tab = self.tab_by_uid(int(index)) if index.isdigit() else None
         if tab is None or state not in DOTS:
             return
@@ -1083,7 +1258,7 @@ class Drawer(Gtk.Application):
         self.monitor_key = monitor.get_connector() or "default"
         self.monitor_width = monitor.get_geometry().width
         saved = self.state["widths"].get(self.monitor_key)
-        want = saved if isinstance(saved, int) else int(self.monitor_width * WIDTH_FRACTION)
+        want = saved if isinstance(saved, int) else int(self.monitor_width * width_fraction())
         self.set_width(want)
 
     def set_width(self, width, save=False):
@@ -1112,7 +1287,7 @@ class Drawer(Gtk.Application):
             self.on_monitors.append(monitor)
         if self.on_monitors and self.grab is None:
             current = self.on_monitors[-1]
-            log(f"on screen {current.get_connector()} ({current.get_geometry().width} wide)")
+            debug(f"on screen {current.get_connector()} ({current.get_geometry().width} wide)")
             self.use_monitor(current)
 
     def pointer_x(self, gesture):
@@ -1160,11 +1335,15 @@ class Drawer(Gtk.Application):
             return
         if self.win is None:
             self.build()
-        os.makedirs(SHOT_DIR, exist_ok=True)
-        cutoff = time.time() - SHOT_KEEP_DAYS * 86400
-        for old in os.scandir(SHOT_DIR):
-            if old.is_file() and old.stat().st_mtime < cutoff:
-                os.unlink(old.path)
+        try:
+            os.makedirs(SHOT_DIR, exist_ok=True)
+            os.chmod(SHOT_DIR, 0o700)      # screenshots are nobody else's business
+            cutoff = time.time() - SHOT_KEEP_DAYS * 86400
+            for old in os.scandir(SHOT_DIR):
+                if old.is_file() and old.stat().st_mtime < cutoff:
+                    os.unlink(old.path)
+        except OSError as e:
+            log(f"could not prepare {SHOT_DIR}: {e}")
         path = os.path.join(SHOT_DIR, time.strftime("screen-%Y%m%d-%H%M%S.png"))
         was_shown = self.shown
         self.shot_running = True
@@ -1201,17 +1380,28 @@ class Drawer(Gtk.Application):
         GLib.timeout_add(ANIM_MS + 80 if was_shown else 1, start)
 
     # ---- events ------------------------------------------------------------
-    def on_child_exited(self, term, _status):
+    def on_child_exited(self, term, status):
         # Claude quit (/exit, Ctrl+C twice): start a fresh session in that tab,
         # and hide the drawer if it was the tab on screen.
         i = next((n for n, t in enumerate(self.tabs) if t.term is term), None)
         if i is None:
             return
         tab = self.tabs[i]
+        tab.pid = 0
         tab.state = "idle"
         tab.note = ""
         self.update_label(i)
         self.withdraw_notification(f"tab{tab.uid}")
+        if tab.halted:
+            return
+        if time.monotonic() - tab.started < QUICK_EXIT_SECONDS:
+            # Claude Code missing or broken, say. What it printed stays on screen.
+            try:
+                how = f"exit status {os.waitstatus_to_exitcode(status)}"
+            except ValueError:
+                how = f"status {status}"
+            self.halt(tab, f"The program in this tab ended right after it started ({how}).")
+            return
         term.reset(True, True)
         self.spawn(tab)
         if self.shown and not self.pinned and i == self.cur:
@@ -1255,7 +1445,7 @@ class Drawer(Gtk.Application):
             self.term.grab_focus()
 
     def on_active_changed(self, win, _pspec):
-        log(f"is-active={win.is_active()} shown={self.shown} pinned={self.pinned}")
+        debug(f"is-active={win.is_active()} shown={self.shown} pinned={self.pinned}")
         if self.watching():
             self.mark_seen(self.cur)
         # Lost keyboard focus (clicked another window/desktop): slide out, unless pinned.
@@ -1265,6 +1455,11 @@ class Drawer(Gtk.Application):
 
     def on_key(self, _ctl, keyval, _code, state):
         cs = Gdk.ModifierType.CONTROL_MASK | Gdk.ModifierType.SHIFT_MASK
+        tab = self.tabs[self.cur]
+        if tab.halted and keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            tab.term.reset(True, True)
+            self.spawn(tab)
+            return True
         # Esc or Ctrl+C can interrupt Claude, and an interrupt is not reported:
         # drop the "working" dot rather than leave it stuck.
         interrupt = keyval == Gdk.KEY_Escape or (
@@ -1297,7 +1492,7 @@ class Drawer(Gtk.Application):
         if self.win is None:
             self.build()
         self.shown = not self.shown
-        log(f"toggle -> shown={self.shown}")
+        debug(f"toggle -> shown={self.shown}")
         start_margin = LayerShell.get_margin(self.win, LayerShell.Edge.LEFT)
         if self.shown:
             if not self.win.get_visible():
@@ -1328,5 +1523,16 @@ class Drawer(Gtk.Application):
         self.anim_id = self.win.add_tick_callback(tick)
 
 
+def main():
+    if not Gtk.init_check():
+        log("glaide: there is no display to open the drawer on")
+        return 1
+    display = Gdk.Display.get_default()
+    if display.__gtype__.name != "GdkWaylandDisplay" or not LayerShell.is_supported():
+        tell_user("Glaide cannot run on this desktop", UNSUPPORTED)
+        return 1
+    return Drawer().run(sys.argv)
+
+
 if __name__ == "__main__":
-    Drawer().run(sys.argv)
+    sys.exit(main())

@@ -6,11 +6,13 @@ open no window.
 """
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -25,7 +27,13 @@ class TempFiles(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.dir = self.tmp.name
         self.saved = {name: getattr(glaide, name) for name in (
-            "PROJECTS_FILE", "APPEARANCE_FILE", "STATE_FILE", "CACHE_DIR", "HOOK_SETTINGS")}
+            "PROJECTS_FILE", "APPEARANCE_FILE", "STATE_FILE", "SETTINGS_FILE", "CACHE_DIR",
+            "HOOK_SETTINGS", "HOOK_SCRIPT")}
+        # Settings of the person running the tests must not leak in.
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GLAIDE_")}
+        self.environ = mock.patch.dict(os.environ, clean, clear=True)
+        self.environ.start()
+        glaide.SETTINGS_FILE = os.path.join(self.dir, "glaide.conf")
         glaide.PROJECTS_FILE = os.path.join(self.dir, "projects.conf")
         glaide.APPEARANCE_FILE = os.path.join(self.dir, "appearance.conf")
         glaide.STATE_FILE = os.path.join(self.dir, "state.json")
@@ -35,11 +43,20 @@ class TempFiles(unittest.TestCase):
     def tearDown(self):
         for name, value in self.saved.items():
             setattr(glaide, name, value)
+        self.environ.stop()
         self.tmp.cleanup()
 
     def write(self, path, text):
         with open(path, "w") as f:
             f.write(text)
+
+    def program(self, *parts):
+        """An executable file under the temporary folder."""
+        path = os.path.join(self.dir, *parts)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self.write(path, "#!/bin/sh\n")
+        os.chmod(path, 0o755)
+        return path
 
 
 class LinkTarget(TempFiles):
@@ -94,6 +111,14 @@ class Projects(TempFiles):
                    f"# comment\nOne = {self.dir}\nGone = {self.dir}/nowhere\nSh = shell:{self.dir}\n")
         self.assertEqual(glaide.load_projects(),
                          [("One", "claude", self.dir, True), ("Sh", "shell", self.dir, True)])
+
+    def test_a_folder_written_with_a_slash_at_the_end_is_the_same_folder(self):
+        self.write(glaide.PROJECTS_FILE, f"One = {self.dir}/\n")
+        self.assertEqual(glaide.load_projects()[0], ("One", "claude", self.dir, True))
+
+    def test_default_tab_uses_the_folder_setting(self):
+        self.write(glaide.SETTINGS_FILE, f"folder = {self.dir}\n")
+        self.assertEqual(glaide.load_projects()[0], ("Claude", "claude", self.dir, False))
 
     def test_remember_and_forget(self):
         self.write(glaide.PROJECTS_FILE, "# mine\nOne = /tmp")      # no newline at the end
@@ -165,6 +190,79 @@ class Appearance(TempFiles):
         provider.load_from_string(css)          # must parse
 
 
+class Settings(TempFiles):
+    def test_file_and_environment(self):
+        self.assertEqual(glaide.setting("editor", "GLAIDE_EDITOR", "none"), "none")
+        self.write(glaide.SETTINGS_FILE, "# editor = hidden\nEditor = zed {file}\n")
+        self.assertEqual(glaide.setting("editor", "GLAIDE_EDITOR"), "zed {file}")
+        with mock.patch.dict(os.environ, {"GLAIDE_EDITOR": "kate"}):
+            self.assertEqual(glaide.setting("editor", "GLAIDE_EDITOR"), "kate")
+
+    def test_template_sets_nothing_by_itself(self):
+        self.write(glaide.SETTINGS_FILE, glaide.SETTINGS_TEMPLATE)
+        self.assertEqual(glaide.read_conf(glaide.SETTINGS_FILE), {})
+
+    def test_claude_is_looked_for_on_the_path_and_where_the_installer_puts_it(self):
+        with mock.patch.dict(os.environ, {"PATH": os.path.join(self.dir, "bin"), "HOME": self.dir}):
+            self.assertIsNone(glaide.claude_program())
+            installed = self.program(".local", "bin", "claude")
+            self.assertEqual(glaide.claude_program(), installed)
+            on_path = self.program("bin", "claude")
+            self.assertEqual(glaide.claude_program(), on_path)
+
+    def test_claude_setting_wins_and_is_not_replaced_when_wrong(self):
+        mine = self.program("elsewhere", "claude")
+        self.write(glaide.SETTINGS_FILE, f"claude = {mine}\n")
+        self.assertEqual(glaide.claude_program(), mine)
+        self.write(glaide.SETTINGS_FILE, f"claude = {self.dir}/nothing-here\n")
+        self.assertIsNone(glaide.claude_program())
+
+    def test_first_start_continues_and_falls_back_to_a_plain_start(self):
+        log = os.path.join(self.dir, "started")
+        claude = os.path.join(self.dir, 'odd "dir" $x', "claude")
+        os.makedirs(os.path.dirname(claude))
+        # Stands in for Claude Code: notes how it was started; "--continue" finds nothing.
+        self.write(claude, '#!/bin/sh\nfor a in "$@"; do printf "%s|" "$a"; done >> "$LOG"\n'
+                           'echo >> "$LOG"\ncase "$*" in *--continue) exit 1 ;; esac\n')
+        os.chmod(claude, 0o755)
+        glaide.HOOK_SETTINGS = os.path.join(self.dir, "a b", "settings.json")
+        argv = glaide.claude_command(claude, True, True)
+        self.assertEqual(subprocess.run(argv, env=dict(os.environ, LOG=log)).returncode, 0)
+        self.assertEqual(glaide.read_text(log).splitlines(),
+                         [f"--settings|{glaide.HOOK_SETTINGS}|--continue|", f"--settings|{glaide.HOOK_SETTINGS}|"])
+        self.assertEqual(glaide.claude_command(claude, False, False), [claude])
+
+    def test_width(self):
+        self.assertEqual(glaide.width_fraction(), glaide.DEFAULT_WIDTH)
+        for text, want in (("0.3", 0.3), ("0,5", 0.5), ("7", 0.95), ("0", 0.1), ("wide", glaide.DEFAULT_WIDTH)):
+            self.write(glaide.SETTINGS_FILE, f"width = {text}\n")
+            self.assertEqual(glaide.width_fraction(), want, text)
+
+    def test_folder_falls_back_to_home(self):
+        home = os.path.expanduser("~")
+        self.assertEqual(glaide.default_folder(), home)
+        self.write(glaide.SETTINGS_FILE, f"folder = {self.dir}/nowhere\n")
+        self.assertEqual(glaide.default_folder(), home)
+
+    def test_editor_command(self):
+        self.write(glaide.SETTINGS_FILE, "editor = zed {file}:{line}:{column}\n")
+        self.assertEqual(glaide.editor_command("/a b/x.py", "12", "3"), ["zed", "/a b/x.py:12:3"])
+        self.assertEqual(glaide.editor_command("/x.py", None, None), ["zed", "/x.py:1:1"])
+        self.write(glaide.SETTINGS_FILE, "editor = konsole -e nvim +{line}\n")     # file goes last
+        self.assertEqual(glaide.editor_command("/x.py", "7", None), ["konsole", "-e", "nvim", "+7", "/x.py"])
+        self.write(glaide.SETTINGS_FILE, "editor = ~/bin/edit '{file}'\n")
+        self.assertEqual(glaide.editor_command("/{line}.py", "7", None),
+                         [os.path.expanduser("~/bin/edit"), "/{line}.py"])
+
+    def test_without_an_editor_setting_it_is_vs_code_or_the_default_app(self):
+        self.write(glaide.SETTINGS_FILE, "editor = 'never closed\n")
+        with mock.patch.dict(os.environ, {"PATH": os.path.join(self.dir, "bin")}):
+            self.assertIsNone(glaide.editor_command("/x.py", "7", None))
+            code = self.program("bin", "code")
+            self.assertEqual(glaide.editor_command("/x.py", "7", "2"), [code, "--goto", "/x.py:7:2"])
+            self.assertEqual(glaide.editor_command("/x.py", None, None), [code, "--goto", "/x.py"])
+
+
 class State(TempFiles):
     def test_missing_and_broken_files(self):
         self.assertEqual(glaide.load_state(), {"widths": {}, "tab_themes": {}})
@@ -190,9 +288,16 @@ class HookSettings(TempFiles):
                     self.assertEqual(hook["type"], "command")
                     self.assertTrue(hook["async"])
                     script, state = hook["command"].rsplit(" ", 1)
-                    self.assertEqual(script, f'"{glaide.HOOK_SCRIPT}"')
+                    self.assertEqual(script, glaide.HOOK_SCRIPT)
                     states.add(state)
         self.assertEqual(states, {"working", "done", "error", "attention"})
+
+    def test_a_script_path_with_spaces_and_quotes_survives_the_shell(self):
+        glaide.HOOK_SCRIPT = os.path.join(self.dir, 'my "own" $HOME', "hook.sh")
+        self.assertTrue(glaide.write_hook_settings())
+        hooks = json.loads(glaide.read_text(glaide.HOOK_SETTINGS))["hooks"]
+        command = hooks["Stop"][0]["hooks"][0]["command"]
+        self.assertEqual(shlex.split(command), [glaide.HOOK_SCRIPT, "done"])
 
 
 class ScreenshotTool(unittest.TestCase):
@@ -274,6 +379,92 @@ class HookScript(unittest.TestCase):
 
     def test_broken_input_still_reports_the_state(self):
         self.assertEqual(self.message("error", "not json"), "3:error:")
+
+
+class Launcher(unittest.TestCase):
+    """Runs bin/glaide with a stand-in gdbus that plays the session bus."""
+
+    GDBUS = """#!/bin/sh
+echo "$*" >> "$GLAIDE_TEST_DIR/calls"
+case "$*" in
+*ReloadConfig*) : > "$GLAIDE_TEST_DIR/reloaded" ;;
+*NameHasOwner*) echo "($GLAIDE_TEST_RUNNING,)" ;;
+*Actions.Activate*)
+    if [ "$GLAIDE_TEST_BUS" = fresh ] && [ ! -e "$GLAIDE_TEST_DIR/reloaded" ]; then
+        echo "Error: GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown: The name is not activatable" >&2
+        exit 1
+    elif [ "$GLAIDE_TEST_BUS" = broken ]; then
+        echo "Error: Timeout was reached" >&2
+        exit 1
+    fi
+    echo "()" ;;
+esac
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        fake = os.path.join(self.tmp.name, "gdbus")
+        with open(fake, "w") as f:
+            f.write(self.GDBUS)
+        os.chmod(fake, 0o755)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_glaide(self, *args, bus="ok", running="true", app_id=None):
+        env = dict(os.environ, PATH=self.tmp.name + os.pathsep + os.environ["PATH"],
+                   GLAIDE_TEST_DIR=self.tmp.name, GLAIDE_TEST_BUS=bus, GLAIDE_TEST_RUNNING=running)
+        env.pop("GLAIDE_APP_ID", None)
+        if app_id:
+            env["GLAIDE_APP_ID"] = app_id
+        result = subprocess.run([os.path.join(ROOT, "bin", "glaide"), *args],
+                                capture_output=True, text=True, env=env)
+        calls = os.path.join(self.tmp.name, "calls")
+        sent = glaide.read_text(calls).splitlines() if os.path.exists(calls) else []
+        return result, sent
+
+    def test_toggles_by_default(self):
+        result, sent = self.run_glaide()
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(len(sent), 1)
+        self.assertIn("--dest io.github.antonstroberg.Glaide --object-path /io/github/antonstroberg/Glaide", sent[0])
+        self.assertIn("org.gtk.Actions.Activate toggle", sent[0])
+
+    def test_another_drawer_can_be_addressed(self):
+        _result, sent = self.run_glaide("pin", app_id="io.example.Test")
+        self.assertIn("--dest io.example.Test --object-path /io/example/Test", sent[0])
+        self.assertIn("Activate pin", sent[0])
+
+    def test_right_after_installing_the_bus_is_asked_to_look_again(self):
+        result, sent = self.run_glaide("toggle", bus="fresh")
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        self.assertEqual(["Activate" in s for s in sent], [True, False, True])
+        self.assertIn("org.freedesktop.DBus.ReloadConfig", sent[1])
+
+    def test_other_errors_are_shown(self):
+        result, sent = self.run_glaide("toggle", bus="broken")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Timeout was reached", result.stderr)
+        self.assertEqual(len(sent), 1)
+
+    def test_unknown_action(self):
+        result, sent = self.run_glaide("dance")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown action", result.stderr)
+        self.assertEqual(sent, [])
+
+    def test_help(self):
+        result, sent = self.run_glaide("--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("screenshot", result.stdout)
+        self.assertEqual(sent, [])
+
+    def test_quit_does_not_start_a_drawer_that_is_not_running(self):
+        result, sent = self.run_glaide("quit", running="false")
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(["Activate" in s for s in sent], [False])
+        _result, sent = self.run_glaide("quit", running="true")
+        self.assertIn("Activate quit", sent[-1])
 
 
 if __name__ == "__main__":
