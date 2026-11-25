@@ -1,0 +1,21 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Arch has every dependency as a package, under the names the README gives.
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed git make python python-gobject python-cairo gtk4 gtk4-layer-shell vte4 jq glib2
+      - uses: actions/checkout@v4
+      - name: Run the tests
+        run: make test
