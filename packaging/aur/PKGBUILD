@@ -19,8 +19,10 @@ sha256sums=('SKIP')
 
 pkgver() {
     cd glaide
-    git describe --long --tags 2>/dev/null | sed 's/^v//;s/-/.r/;s/-/./' \
-        || printf '0.1.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+    # pipefail: without it the pipe succeeds when there is no tag, and the version comes out empty.
+    ( set -o pipefail
+      git describe --long --tags 2>/dev/null | sed 's/^v//;s/-/.r/;s/-/./' \
+          || printf '0.1.0.r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)" )
 }
 
 package() {
